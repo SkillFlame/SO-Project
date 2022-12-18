@@ -242,24 +242,33 @@ int tfs_unlink(char const *target) {
 }
 
 int tfs_copy_from_external_fs(char const *source_path, char const *dest_path) {
-	size_t block_size = state_block_size();
-	char buffer[block_size];
 	FILE* source_file;
-	int tfs_file_id;
-	ssize_t writhen_bytes;
+	size_t block_size = state_block_size();
 	
+	int tfs_file_id;
+	
+	char buffer[block_size];
+	memset(buffer,0,sizeof(buffer));
+	
+	ssize_t writhen_bytes;
+
 	source_file = fopen(source_path, "r");
 	if(!source_file)
 		return -1;
+
 	fread(buffer, sizeof(buffer), 1, source_file); // change 1 to actual value and handle possible errors
 	
+	fclose(source_file);
+
 	tfs_file_id = tfs_open(dest_path, TFS_O_CREAT);
 	if(tfs_file_id ==  -1)
 		return -1;
 
-	writhen_bytes = tfs_write(tfs_file_id, buffer, sizeof(buffer));
-	if(writhen_bytes == -1 || sizeof(writhen_bytes) != sizeof(buffer))
+	writhen_bytes = tfs_write(tfs_file_id, buffer, strlen(buffer));
+	if(writhen_bytes < strlen(buffer))
 		return -1;
+
+	tfs_close(tfs_file_id);
 	
 	return 0;
 }
