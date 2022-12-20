@@ -8,27 +8,36 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
+#include <pthread.h>
 
 /**
  * Directory entry
  */
 typedef struct {
-    char d_name[MAX_FILE_NAME];
-    int d_inumber;
+	char d_name[MAX_FILE_NAME];
+	int d_inumber;
+
+	pthread_rwlock_t rwlock;
 } dir_entry_t;
 
-typedef enum { T_FILE, T_DIRECTORY } inode_type;
+pthread_rwlock_t dir_entry_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+typedef enum { T_FILE, T_DIRECTORY, T_SOFT } inode_type;
 
 /**
  * Inode
  */
 typedef struct {
-    inode_type i_node_type;
+	inode_type i_node_type;
 
-    size_t i_size;
-    int i_data_block;
+	size_t i_size;
+	int i_data_block;
+	int i_link_counter;
 
-    // in a more complete FS, more fields could exist here
+	pthread_rwlock_t rwlock;
+	pthread_mutex_t mutex;
+
+	// in a more complete FS, more fields could exist here
 } inode_t;
 
 typedef enum { FREE = 0, TAKEN = 1 } allocation_state_t;
@@ -37,8 +46,8 @@ typedef enum { FREE = 0, TAKEN = 1 } allocation_state_t;
  * Open file entry (in open file table)
  */
 typedef struct {
-    int of_inumber;
-    size_t of_offset;
+	int of_inumber;
+	size_t of_offset;
 } open_file_entry_t;
 
 int state_init(tfs_params);

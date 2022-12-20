@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "betterassert.h"
 
@@ -62,7 +63,14 @@ static bool valid_pathname(char const *name) {
  * Returns the inumber of the file, -1 if unsuccessful.
  */
 static int tfs_lookup(char const *name, inode_t const *root_inode) {
-	// TODO: assert that root_inode is the root directory
+	inode_t *root_dir_inode = inode_get(ROOT_DIR_INUM);
+	ALWAYS_ASSERT(root_dir_inode != NULL,
+				  "tfs_open: root dir inode must exist");
+
+	if (root_inode != root_dir_inode) {
+		return -1;
+	}
+
 	if (!valid_pathname(name)) {
 		return -1;
 	}
@@ -82,6 +90,7 @@ int tfs_open(char const *name, tfs_file_mode_t mode) {
 	inode_t *root_dir_inode = inode_get(ROOT_DIR_INUM);
 	ALWAYS_ASSERT(root_dir_inode != NULL,
 				  "tfs_open: root dir inode must exist");
+	pthread_rwlock_rdlock(&root_dir_inode->rwlock);
 	int inum = tfs_lookup(name, root_dir_inode);
 	size_t offset;
 
@@ -90,6 +99,29 @@ int tfs_open(char const *name, tfs_file_mode_t mode) {
 		inode_t *inode = inode_get(inum);
 		ALWAYS_ASSERT(inode != NULL,
 					  "tfs_open: directory files must have an inode");
+		
+		pthread_rwlock_rdlock(&inode->rwlock);
+		
+		while (inode->i_node_type == T_SOFT) {
+			// If it is a softlink we'll get the reference
+			char target[inode->i_size];
+			void *block = data_block_get(inode->i_data_block);
+			memcpy(target, block, inode->i_size);
+			inum = tfs_lookup(target, root_dir_inode);
+			if (inum == -1) {
+				pthread_rwlock_unlock(&inode->rwlock);
+				pthread_rwlock_unlock(&root_dir_inode->rwlock);
+				return -1;
+			}
+				
+			pthread_rwlock_unlock(&inode->rwlock);
+			inode = inode_get(inum);
+			ALWAYS_ASSERT(inode != NULL,
+					  "tfs_open: directory files must have an inode");
+			pthread_rwlock_rdlock(&inode->rwlock);
+		}
+
+
 
 		// Truncate (if requested)
 		if (mode & TFS_O_TRUNC) {
@@ -104,24 +136,29 @@ int tfs_open(char const *name, tfs_file_mode_t mode) {
 		} else {
 			offset = 0;
 		}
+		pthread_rwlock_unlock(&inode->rwlock);
 	} else if (mode & TFS_O_CREAT) {
 		// The file does not exist; the mode specified that it should be created
 		// Create inode
 		inum = inode_create(T_FILE);
 		if (inum == -1) {
+			pthread_rwlock_unlock(&root_dir_inode->rwlock);
 			return -1; // no space in inode table
 		}
 
 		// Add entry in the root directory
 		if (add_dir_entry(root_dir_inode, name + 1, inum) == -1) {
 			inode_delete(inum);
+			pthread_rwlock_unlock(&root_dir_inode->rwlock);
 			return -1; // no space in directory
 		}
 
 		offset = 0;
 	} else {
+		pthread_rwlock_unlock(&root_dir_inode->rwlock);
 		return -1;
 	}
+	pthread_rwlock_unlock(&root_dir_inode->rwlock);	
 
 	// Finally, add entry to the open file table and return the corresponding
 	// handle
@@ -133,21 +170,77 @@ int tfs_open(char const *name, tfs_file_mode_t mode) {
 }
 
 int tfs_sym_link(char const *target, char const *link_name) {
-	(void)target;
-	(void)link_name;
-	// ^ this is a trick to keep the compiler from complaining about unused
-	// variables. TODO: remove
+	inode_t *root_dir_inode = inode_get(ROOT_DIR_INUM);
+	ALWAYS_ASSERT(root_dir_inode != NULL,
+				  "tfs_open: root dir inode must exist");
+	pthread_rwlock_rdlock(&root_dir_inode->rwlock);
+	
+	if (tfs_lookup(target, root_dir_inode) == -1) {
+		pthread_rwlock_unlock(&root_dir_inode->rwlock);
+		return -1;
+	}  // if invalid inum
+		
 
-	PANIC("TODO: tfs_sym_link");
+	if (!valid_pathname(link_name)) {
+		pthread_rwlock_unlock(&root_dir_inode->rwlock);
+		return -1;
+	}
+		
+
+	int inum = inode_create(T_SOFT);
+	inode_t *inode = inode_get(inum);
+
+	void *block = data_block_get(inode->i_data_block);
+	inode->i_size += strlen(target);
+
+	memcpy(block, target, strlen(target));
+
+	if (add_dir_entry(root_dir_inode, link_name + 1, inum) == -1) {
+		inode_delete(inum);
+		pthread_rwlock_unlock(&root_dir_inode->rwlock);
+		return -1;
+	}
+	pthread_rwlock_unlock(&root_dir_inode->rwlock);
+	return 0;
 }
 
 int tfs_link(char const *target, char const *link_name) {
-	(void)target;
-	(void)link_name;
-	// ^ this is a trick to keep the compiler from complaining about unused
-	// variables. TODO: remove
+	inode_t *root_dir_inode = inode_get(ROOT_DIR_INUM);
+	ALWAYS_ASSERT(root_dir_inode != NULL,
+				  "tfs_open: root dir inode must exist");
+	pthread_rwlock_rdlock(&root_dir_inode->rwlock);
+	
+	int inum = tfs_lookup(target, root_dir_inode);
+	pthread_rwlock_rdlock(&inode_get(inum)->rwlock);
 
-	PANIC("TODO: tfs_link");
+	if (inum == -1){
+	pthread_rwlock_unlock(&inode_get(inum)->rwlock);
+		pthread_rwlock_unlock(&root_dir_inode->rwlock);
+		return -1;
+	}  // if invalid inum
+		
+
+	if (!valid_pathname(link_name)){
+		pthread_rwlock_unlock(&inode_get(inum)->rwlock);
+		pthread_rwlock_unlock(&root_dir_inode->rwlock);
+		return -1;
+	}
+
+	if (inode_get(inum)->i_node_type == T_SOFT){
+		pthread_rwlock_unlock(&inode_get(inum)->rwlock);
+		pthread_rwlock_unlock(&root_dir_inode->rwlock);
+		return -1;
+	}  // can't hardlink a softlink
+
+	if (add_dir_entry(root_dir_inode, link_name + 1, inum) == -1) {
+		pthread_rwlock_unlock(&inode_get(inum)->rwlock);
+		pthread_rwlock_unlock(&root_dir_inode->rwlock);
+		inode_delete(inum);
+		return -1;
+	}	
+	pthread_rwlock_unlock(&inode_get(inum)->rwlock);
+	pthread_rwlock_unlock(&root_dir_inode->rwlock);
+	return 0;
 }
 
 int tfs_close(int fhandle) {
@@ -170,6 +263,7 @@ ssize_t tfs_write(int fhandle, void const *buffer, size_t to_write) {
 	//  From the open file table entry, we get the inode
 	inode_t *inode = inode_get(file->of_inumber);
 	ALWAYS_ASSERT(inode != NULL, "tfs_write: inode of open file deleted");
+	pthread_rwlock_wrlock(&inode->rwlock);
 
 	// Determine how many bytes to write
 	size_t block_size = state_block_size();
@@ -182,6 +276,7 @@ ssize_t tfs_write(int fhandle, void const *buffer, size_t to_write) {
 			// If empty file, allocate new block
 			int bnum = data_block_alloc();
 			if (bnum == -1) {
+				pthread_rwlock_unlock(&inode->rwlock);
 				return -1; // no space
 			}
 
@@ -200,7 +295,7 @@ ssize_t tfs_write(int fhandle, void const *buffer, size_t to_write) {
 			inode->i_size = file->of_offset;
 		}
 	}
-
+	pthread_rwlock_unlock(&inode->rwlock);
 	return (ssize_t)to_write;
 }
 
@@ -213,6 +308,7 @@ ssize_t tfs_read(int fhandle, void *buffer, size_t len) {
 	// From the open file table entry, we get the inode
 	inode_t const *inode = inode_get(file->of_inumber);
 	ALWAYS_ASSERT(inode != NULL, "tfs_read: inode of open file deleted");
+	pthread_rwlock_rdlock(&inode_get(file->of_inumber)->rwlock);
 
 	// Determine how many bytes to read
 	size_t to_read = inode->i_size - file->of_offset;
@@ -229,43 +325,67 @@ ssize_t tfs_read(int fhandle, void *buffer, size_t len) {
 		// The offset associated with the file handle is incremented accordingly
 		file->of_offset += to_read;
 	}
-
+	pthread_rwlock_unlock(&inode_get(file->of_inumber)->rwlock);
 	return (ssize_t)to_read;
 }
 
 int tfs_unlink(char const *target) {
-	(void)target;
-	// ^ this is a trick to keep the compiler from complaining about unused
-	// variables. TODO: remove
+	inode_t *root_dir_inode = inode_get(ROOT_DIR_INUM);
+	ALWAYS_ASSERT(root_dir_inode != NULL,
+				  "tfs_open: root dir inode must exist");
+	pthread_rwlock_rdlock(&root_dir_inode->rwlock);
+	int inum = tfs_lookup(target, root_dir_inode);
+	
+	if (inum == -1) {
+		return -1;
+	}
+	inode_t *inode = inode_get(inum);
+	pthread_rwlock_rdlock(&inode->rwlock);
 
-	PANIC("TODO: tfs_unlink");
+	if (inode->i_node_type == T_SOFT) {
+		pthread_rwlock_unlock(&inode->rwlock);
+		inode_delete(inum);
+		pthread_rwlock_unlock(&root_dir_inode->rwlock);
+		return clear_dir_entry(root_dir_inode, target + 1);
+	}
+	clear_dir_entry(root_dir_inode, target + 1);
+	inode->i_link_counter--;
+	if (inode->i_link_counter == 0) {
+		pthread_rwlock_unlock(&inode->rwlock);
+		inode_delete(inum);
+	}
+	pthread_rwlock_unlock(&inode->rwlock);
+	pthread_rwlock_unlock(&root_dir_inode->rwlock);
+	return 0;
 }
 
 int tfs_copy_from_external_fs(char const *source_path, char const *dest_path) {
 	FILE* source_file;
 	size_t block_size = state_block_size();
+	size_t read_bytes;
+	ssize_t written_bytes;
 	
 	int tfs_file_id;
 	
 	char buffer[block_size];
-	memset(buffer,0,sizeof(buffer));
-	
-	ssize_t writhen_bytes;
+	memset(buffer, 0, sizeof(buffer));
 
 	source_file = fopen(source_path, "r");
 	if(!source_file)
 		return -1;
 
-	fread(buffer, sizeof(buffer), 1, source_file); // change 1 to actual value and handle possible errors
-	
+	read_bytes = fread(buffer, sizeof(buffer), 1, source_file); // change 1 to actual value and handle possible errors
+	if (read_bytes == -1)
+		return -1;
+
 	fclose(source_file);
 
 	tfs_file_id = tfs_open(dest_path, TFS_O_CREAT);
 	if(tfs_file_id ==  -1)
 		return -1;
 
-	writhen_bytes = tfs_write(tfs_file_id, buffer, strlen(buffer));
-	if(writhen_bytes < strlen(buffer))
+	written_bytes = tfs_write(tfs_file_id, buffer, strlen(buffer));
+	if(written_bytes < strlen(buffer))
 		return -1;
 
 	tfs_close(tfs_file_id);
